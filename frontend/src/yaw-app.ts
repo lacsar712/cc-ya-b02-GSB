@@ -1,23 +1,9 @@
 import { css, html, LitElement } from "lit";
 import { customElement, state } from "lit/decorators.js";
+import "./lightning-page";
+import type { LightningStatus, LogRow, Session } from "./types";
 
-type LogRow = {
-  id: number;
-  turbine_code: string;
-  yaw_err_deg: number;
-  status: string;
-  verdict: string | null;
-  reason: string | null;
-  created_by: string;
-  created_at: string;
-  processed_at: string | null;
-};
-
-type Session = {
-  token: string;
-  username: string;
-  role: string;
-};
+type View = "home" | "lightning";
 
 @customElement("yaw-align-app")
 export class YawAlignApp extends LitElement {
@@ -26,18 +12,75 @@ export class YawAlignApp extends LitElement {
       display: block;
       min-height: 100vh;
       box-sizing: border-box;
-      padding: 1.5rem;
-      max-width: 960px;
+      padding: 0 1.5rem 1.5rem;
+      max-width: 1040px;
       margin: 0 auto;
+    }
+    .topbar {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      padding: 0.9rem 0;
+      border-bottom: 1px solid #334155;
+      margin-bottom: 1.25rem;
+      flex-wrap: wrap;
+    }
+    .brand {
+      font-size: 1.15rem;
+      font-weight: 700;
+      color: #38bdf8;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    nav {
+      display: flex;
+      gap: 0.4rem;
+    }
+    .nav-btn {
+      cursor: pointer;
+      background: transparent;
+      border: 1px solid transparent;
+      color: #cbd5e1;
+      padding: 0.4rem 0.9rem;
+      border-radius: 6px;
+      font-size: 0.92rem;
+      font-weight: 500;
+      position: relative;
+    }
+    .nav-btn:hover {
+      background: #1e293b;
+    }
+    .nav-btn.active {
+      background: #0c4a6e;
+      color: #e0f2fe;
+      border-color: #0369a1;
+    }
+    .nav-dot {
+      position: absolute;
+      top: 0.3rem;
+      right: 0.35rem;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #f87171;
+      box-shadow: 0 0 6px #f87171;
+    }
+    .spacer {
+      flex: 1;
+    }
+    .user-chip {
+      font-size: 0.85rem;
+      color: #94a3b8;
+      white-space: nowrap;
     }
     h1 {
       margin: 0 0 0.25rem;
-      font-size: 1.75rem;
+      font-size: 1.6rem;
       color: #38bdf8;
     }
     .sub {
       color: #94a3b8;
-      margin-bottom: 1.5rem;
+      margin-bottom: 1.25rem;
     }
     section {
       background: #1e293b;
@@ -62,7 +105,7 @@ export class YawAlignApp extends LitElement {
       color: #f1f5f9;
       margin-bottom: 0.75rem;
     }
-    button {
+    button.action-btn {
       cursor: pointer;
       padding: 0.5rem 1rem;
       border-radius: 6px;
@@ -72,7 +115,13 @@ export class YawAlignApp extends LitElement {
       font-weight: 600;
     }
     button.secondary {
-      background: #475569;
+      cursor: pointer;
+      padding: 0.4rem 0.9rem;
+      border-radius: 6px;
+      border: 1px solid #475569;
+      background: #334155;
+      color: #e2e8f0;
+      font-size: 0.88rem;
     }
     button:disabled {
       opacity: 0.5;
@@ -121,16 +170,63 @@ export class YawAlignApp extends LitElement {
       flex-wrap: wrap;
       align-items: center;
     }
+    .lock-banner {
+      border-radius: 8px;
+      padding: 0.85rem 1.1rem;
+      margin-bottom: 1rem;
+      border: 1px solid;
+      font-size: 0.92rem;
+      line-height: 1.6;
+    }
+    .lock-open {
+      background: #450a0a;
+      border-color: #b91c1c;
+      color: #fecaca;
+    }
+    .lock-hold {
+      background: #422006;
+      border-color: #b45309;
+      color: #fde68a;
+    }
+    .lock-banner strong {
+      display: block;
+      font-size: 1rem;
+      margin-bottom: 0.15rem;
+    }
+    .lock-link {
+      color: #7dd3fc;
+      cursor: pointer;
+      text-decoration: underline;
+      background: none;
+      border: none;
+      padding: 0;
+      font: inherit;
+    }
+    .reject-box {
+      background: #450a0a;
+      border: 1px solid #b91c1c;
+      color: #fecaca;
+      border-radius: 6px;
+      padding: 0.7rem 0.9rem;
+      margin-top: 0.6rem;
+      line-height: 1.6;
+    }
   `;
 
   @state() private session: Session | null = null;
+  @state() private view: View = "home";
   @state() private logs: LogRow[] = [];
+  @state() private lockStatus: LightningStatus | null = null;
   @state() private loginUser = "technician";
   @state() private loginPass = "tech123456";
   @state() private turbineCode = "";
   @state() private yawErr = "";
   @state() private error = "";
+  @state() private rejectDetail = "";
   @state() private loading = false;
+
+  private pollTimer?: number;
+  private lockTimer?: number;
 
   connectedCallback() {
     super.connectedCallback();
@@ -138,8 +234,7 @@ export class YawAlignApp extends LitElement {
     if (raw) {
       try {
         this.session = JSON.parse(raw) as Session;
-        void this.refreshLogs();
-        this._pollTimer = window.setInterval(() => void this.refreshLogs(), 2000);
+        void this.startPolling();
       } catch {
         localStorage.removeItem("yaw_session");
       }
@@ -148,17 +243,28 @@ export class YawAlignApp extends LitElement {
 
   disconnectedCallback() {
     super.disconnectedCallback();
-    if (this._pollTimer) {
-      clearInterval(this._pollTimer);
-    }
+    this.clearTimers();
   }
 
-  private _pollTimer?: number;
+  private clearTimers() {
+    if (this.pollTimer) clearInterval(this.pollTimer);
+    if (this.lockTimer) clearInterval(this.lockTimer);
+    this.pollTimer = undefined;
+    this.lockTimer = undefined;
+  }
 
   private authHeaders(): HeadersInit {
     return this.session
       ? { Authorization: `Bearer ${this.session.token}` }
       : {};
+  }
+
+  private async startPolling() {
+    this.clearTimers();
+    await this.refreshLogs();
+    await this.refreshLock();
+    this.pollTimer = window.setInterval(() => void this.refreshLogs(), 2000);
+    this.lockTimer = window.setInterval(() => void this.refreshLock(), 2000);
   }
 
   private async refreshLogs() {
@@ -171,6 +277,23 @@ export class YawAlignApp extends LitElement {
       }
       if (!res.ok) return;
       this.logs = (await res.json()) as LogRow[];
+    } catch {
+      /* ignore transient network errors */
+    }
+  }
+
+  private async refreshLock() {
+    if (!this.session) return;
+    try {
+      const res = await fetch("/api/lightning/status", {
+        headers: this.authHeaders(),
+      });
+      if (res.status === 401) {
+        this.logout();
+        return;
+      }
+      if (!res.ok) return;
+      this.lockStatus = (await res.json()) as LightningStatus;
     } catch {
       /* ignore transient network errors */
     }
@@ -199,8 +322,8 @@ export class YawAlignApp extends LitElement {
         role: data.role,
       };
       localStorage.setItem("yaw_session", JSON.stringify(this.session));
-      await this.refreshLogs();
-      this._pollTimer = window.setInterval(() => void this.refreshLogs(), 2000);
+      this.view = "home";
+      await this.startPolling();
     } catch {
       this.error = "无法连接接口";
     } finally {
@@ -209,9 +332,11 @@ export class YawAlignApp extends LitElement {
   }
 
   private logout() {
-    if (this._pollTimer) clearInterval(this._pollTimer);
+    this.clearTimers();
     this.session = null;
     this.logs = [];
+    this.lockStatus = null;
+    this.view = "home";
     localStorage.removeItem("yaw_session");
   }
 
@@ -221,6 +346,7 @@ export class YawAlignApp extends LitElement {
 
   private async submitLog() {
     this.error = "";
+    this.rejectDetail = "";
     this.loading = true;
     try {
       const res = await fetch("/api/logs", {
@@ -236,7 +362,12 @@ export class YawAlignApp extends LitElement {
       });
       const data = await res.json();
       if (!res.ok) {
-        this.error = data.detail || "提交失败";
+        // 409：联闸越限整单退回
+        if (res.status === 409) {
+          this.rejectDetail = data.detail || "雷电联闸生效中，本单整单退回";
+        } else {
+          this.error = data.detail || "提交失败";
+        }
         return;
       }
       this.turbineCode = "";
@@ -256,45 +387,76 @@ export class YawAlignApp extends LitElement {
     return "";
   }
 
-  render() {
-    if (!this.session) {
-      return html`
-        <h1>风机偏航对中台</h1>
-        <p class="sub">现场技师提交偏航误差，后台 worker 认领后给出合格或偏航超差结论。</p>
-        <section>
-          <label>用户名</label>
-          <input
-            .value=${this.loginUser}
-            @input=${(e: Event) =>
-              (this.loginUser = (e.target as HTMLInputElement).value)}
-          />
-          <label>密码</label>
-          <input
-            type="password"
-            .value=${this.loginPass}
-            @input=${(e: Event) =>
-              (this.loginPass = (e.target as HTMLInputElement).value)}
-          />
-          <button ?disabled=${this.loading} @click=${this.login}>登录</button>
-          ${this.error ? html`<p class="err">${this.error}</p>` : null}
-        </section>
-      `;
-    }
+  private go(view: View) {
+    this.view = view;
+  }
 
+  private renderTopbar() {
+    const over = this.lockStatus?.latest?.is_over_limit ?? false;
     return html`
-      <h1>风机偏航对中台</h1>
-      <p class="sub">
-        已登录：${this.session.username}
-        (${this.isWriter ? "可提交" : "只读"})
-      </p>
-      <section>
-        <div class="row-actions">
-          <button class="secondary" @click=${this.logout}>退出</button>
-          <button class="secondary" ?disabled=${this.loading} @click=${this.refreshLogs}>
-            刷新列表
+      <header class="topbar">
+        <span class="brand" @click=${() => this.go("home")}>风机偏航对中台</span>
+        <nav>
+          <button
+            class="nav-btn ${this.view === "home" ? "active" : ""}"
+            @click=${() => this.go("home")}
+          >
+            偏航报送
           </button>
-        </div>
-      </section>
+          <button
+            class="nav-btn ${this.view === "lightning" ? "active" : ""}"
+            @click=${() => this.go("lightning")}
+          >
+            雷电联闸
+            ${this.lockStatus?.is_open
+              ? html`<span class="nav-dot" title=${over ? "联闸生效且读数越限" : "联闸生效中"}></span>`
+              : null}
+          </button>
+        </nav>
+        <span class="spacer"></span>
+        <span class="user-chip">
+          ${this.session!.username}（${this.isWriter ? "现场技师" : "观察员"}）
+        </span>
+        <button class="secondary" @click=${this.logout}>退出</button>
+      </header>
+    `;
+  }
+
+  private renderLockBanner() {
+    const s = this.lockStatus;
+    if (!s || !s.is_open) return null;
+    const over = s.latest?.is_over_limit;
+    const cls = over ? "lock-open" : "lock-hold";
+    return html`
+      <div class="lock-banner ${cls}">
+        <strong>
+          ${over
+            ? "⛈ 雷电联闸生效中且电场读数越限：偏航报送已一刀切暂停，新单整单退回"
+            : "⛈ 雷电联闸生效中：读数尚在限值内，报送可继续；越限即整单退回"}
+        </strong>
+        当前服务端电场读数
+        ${s.latest ? `${s.latest.field_kvm} kV/m` : "采集启动中…"}，
+        电场上限 ${s.field_threshold_kvm} kV/m。读数回落或
+        <button class="lock-link" @click=${() => this.go("lightning")}>
+          前往雷电联闸专页关闭
+        </button>
+        后恢复。
+      </div>
+    `;
+  }
+
+  private renderHome() {
+    return html`
+      <h1>偏航报送</h1>
+      <p class="sub">现场技师提交偏航误差，后台 worker 认领后给出合格或偏航超差结论。</p>
+
+      <div class="row-actions" style="margin-bottom:0.75rem">
+        <button class="secondary" ?disabled=${this.loading} @click=${this.refreshLogs}>
+          刷新列表
+        </button>
+      </div>
+
+      ${this.renderLockBanner()}
 
       ${this.isWriter
         ? html`
@@ -315,10 +477,13 @@ export class YawAlignApp extends LitElement {
                 @input=${(e: Event) =>
                   (this.yawErr = (e.target as HTMLInputElement).value)}
               />
-              <button ?disabled=${this.loading} @click=${this.submitLog}>
+              <button class="action-btn" ?disabled=${this.loading} @click=${this.submitLog}>
                 提交（进入待认领队列）
               </button>
               ${this.error ? html`<p class="err">${this.error}</p>` : null}
+              ${this.rejectDetail
+                ? html`<div class="reject-box">⛈ ${this.rejectDetail}</div>`
+                : null}
             </section>
           `
         : null}
@@ -360,6 +525,46 @@ export class YawAlignApp extends LitElement {
           </tbody>
         </table>
       </section>
+    `;
+  }
+
+  render() {
+    if (!this.session) {
+      return html`
+        <h1 style="margin-top:1.25rem">风机偏航对中台</h1>
+        <p class="sub">现场技师提交偏航误差；雷电联闸生效时，越限报送整单退回。</p>
+        <section>
+          <label>用户名</label>
+          <input
+            .value=${this.loginUser}
+            @input=${(e: Event) =>
+              (this.loginUser = (e.target as HTMLInputElement).value)}
+          />
+          <label>密码</label>
+          <input
+            type="password"
+            .value=${this.loginPass}
+            @input=${(e: Event) =>
+              (this.loginPass = (e.target as HTMLInputElement).value)}
+          />
+          <button class="action-btn" ?disabled=${this.loading} @click=${this.login}>
+            登录
+          </button>
+          ${this.error ? html`<p class="err">${this.error}</p>` : null}
+        </section>
+      `;
+    }
+
+    return html`
+      ${this.renderTopbar()}
+      ${this.view === "home"
+        ? this.renderHome()
+        : html`
+            <lightning-page
+              .session=${this.session}
+              @unauthorized=${this.logout}
+            ></lightning-page>
+          `}
     `;
   }
 }
