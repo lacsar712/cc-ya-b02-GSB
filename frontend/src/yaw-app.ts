@@ -1,6 +1,10 @@
 import { css, html, LitElement } from "lit";
 import { customElement, state } from "lit/decorators.js";
 
+import type { Session } from "./types";
+import type { InterlockStatus } from "./yaw-interlock";
+import "./yaw-interlock";
+
 type LogRow = {
   id: number;
   turbine_code: string;
@@ -13,11 +17,7 @@ type LogRow = {
   processed_at: string | null;
 };
 
-type Session = {
-  token: string;
-  username: string;
-  role: string;
-};
+type View = "logs" | "interlock";
 
 @customElement("yaw-align-app")
 export class YawAlignApp extends LitElement {
@@ -27,7 +27,7 @@ export class YawAlignApp extends LitElement {
       min-height: 100vh;
       box-sizing: border-box;
       padding: 1.5rem;
-      max-width: 960px;
+      max-width: 1100px;
       margin: 0 auto;
     }
     h1 {
@@ -38,6 +38,52 @@ export class YawAlignApp extends LitElement {
     .sub {
       color: #94a3b8;
       margin-bottom: 1.5rem;
+    }
+    .topbar {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      padding: 0.6rem 1rem;
+      margin-bottom: 1rem;
+      position: sticky;
+      top: 0.5rem;
+      z-index: 10;
+    }
+    .brand {
+      color: #38bdf8;
+      font-weight: 700;
+      font-size: 1.05rem;
+      white-space: nowrap;
+    }
+    nav {
+      display: flex;
+      gap: 0.4rem;
+      flex: 1;
+    }
+    button.nav {
+      background: transparent;
+      color: #94a3b8;
+    }
+    button.nav.active {
+      background: #0284c7;
+      color: #fff;
+    }
+    .who {
+      color: #94a3b8;
+      font-size: 0.85rem;
+      white-space: nowrap;
+    }
+    .banner {
+      background: #451a03;
+      border: 1px solid #b45309;
+      color: #fcd34d;
+      border-radius: 8px;
+      padding: 0.7rem 1rem;
+      margin-bottom: 1rem;
+      font-size: 0.9rem;
     }
     section {
       background: #1e293b;
@@ -125,6 +171,8 @@ export class YawAlignApp extends LitElement {
 
   @state() private session: Session | null = null;
   @state() private logs: LogRow[] = [];
+  @state() private interlock: InterlockStatus | null = null;
+  @state() private view: View = "logs";
   @state() private loginUser = "technician";
   @state() private loginPass = "tech123456";
   @state() private turbineCode = "";
@@ -138,8 +186,7 @@ export class YawAlignApp extends LitElement {
     if (raw) {
       try {
         this.session = JSON.parse(raw) as Session;
-        void this.refreshLogs();
-        this._pollTimer = window.setInterval(() => void this.refreshLogs(), 2000);
+        this.startPolling();
       } catch {
         localStorage.removeItem("yaw_session");
       }
@@ -154,6 +201,19 @@ export class YawAlignApp extends LitElement {
   }
 
   private _pollTimer?: number;
+
+  private startPolling() {
+    void this.poll();
+    if (this._pollTimer) clearInterval(this._pollTimer);
+    this._pollTimer = window.setInterval(() => void this.poll(), 2000);
+  }
+
+  private async poll() {
+    await this.refreshLogs();
+    if (this.view === "logs") {
+      await this.refreshInterlock();
+    }
+  }
 
   private authHeaders(): HeadersInit {
     return this.session
@@ -171,6 +231,23 @@ export class YawAlignApp extends LitElement {
       }
       if (!res.ok) return;
       this.logs = (await res.json()) as LogRow[];
+    } catch {
+      /* ignore transient network errors */
+    }
+  }
+
+  private async refreshInterlock() {
+    if (!this.session) return;
+    try {
+      const res = await fetch("/api/interlock", {
+        headers: this.authHeaders(),
+      });
+      if (res.status === 401) {
+        this.logout();
+        return;
+      }
+      if (!res.ok) return;
+      this.interlock = (await res.json()) as InterlockStatus;
     } catch {
       /* ignore transient network errors */
     }
@@ -199,8 +276,7 @@ export class YawAlignApp extends LitElement {
         role: data.role,
       };
       localStorage.setItem("yaw_session", JSON.stringify(this.session));
-      await this.refreshLogs();
-      this._pollTimer = window.setInterval(() => void this.refreshLogs(), 2000);
+      this.startPolling();
     } catch {
       this.error = "无法连接接口";
     } finally {
@@ -212,6 +288,8 @@ export class YawAlignApp extends LitElement {
     if (this._pollTimer) clearInterval(this._pollTimer);
     this.session = null;
     this.logs = [];
+    this.interlock = null;
+    this.view = "logs";
     localStorage.removeItem("yaw_session");
   }
 
@@ -236,7 +314,9 @@ export class YawAlignApp extends LitElement {
       });
       const data = await res.json();
       if (!res.ok) {
+        // 联闸整单退回（409）等服务端错误在此提示，表单内容保留以便解除后重报
         this.error = data.detail || "提交失败";
+        await this.refreshInterlock();
         return;
       }
       this.turbineCode = "";
@@ -256,46 +336,43 @@ export class YawAlignApp extends LitElement {
     return "";
   }
 
-  render() {
-    if (!this.session) {
-      return html`
-        <h1>风机偏航对中台</h1>
-        <p class="sub">现场技师提交偏航误差，后台 worker 认领后给出合格或偏航超差结论。</p>
-        <section>
-          <label>用户名</label>
-          <input
-            .value=${this.loginUser}
-            @input=${(e: Event) =>
-              (this.loginUser = (e.target as HTMLInputElement).value)}
-          />
-          <label>密码</label>
-          <input
-            type="password"
-            .value=${this.loginPass}
-            @input=${(e: Event) =>
-              (this.loginPass = (e.target as HTMLInputElement).value)}
-          />
-          <button ?disabled=${this.loading} @click=${this.login}>登录</button>
-          ${this.error ? html`<p class="err">${this.error}</p>` : null}
-        </section>
-      `;
-    }
-
+  private renderTopbar() {
     return html`
-      <h1>风机偏航对中台</h1>
-      <p class="sub">
-        已登录：${this.session.username}
-        (${this.isWriter ? "可提交" : "只读"})
-      </p>
-      <section>
-        <div class="row-actions">
-          <button class="secondary" @click=${this.logout}>退出</button>
-          <button class="secondary" ?disabled=${this.loading} @click=${this.refreshLogs}>
-            刷新列表
+      <header class="topbar">
+        <span class="brand">风机偏航对中台</span>
+        <nav>
+          <button
+            class="nav ${this.view === "logs" ? "active" : ""}"
+            @click=${() => (this.view = "logs")}
+          >
+            对中记录
           </button>
-        </div>
-      </section>
+          <button
+            class="nav ${this.view === "interlock" ? "active" : ""}"
+            @click=${() => (this.view = "interlock")}
+          >
+            雷电联闸
+          </button>
+        </nav>
+        <span class="who">
+          ${this.session?.username}（${this.isWriter ? "可提交" : "只读"}）
+        </span>
+        <button class="secondary" @click=${this.logout}>退出</button>
+      </header>
+    `;
+  }
 
+  private renderLogs() {
+    return html`
+      ${this.interlock?.engaged
+        ? html`
+            <div class="banner">
+              ⚡ 雷电联闸开闸中（电场上限 ${this.interlock.threshold_kv_m}
+              kV/m，当前读数 ${this.interlock.latest_reading_kv_m ?? "—"}
+              kV/m）：读数越界将整单退回，解除联闸后恢复报送。
+            </div>
+          `
+        : null}
       ${this.isWriter
         ? html`
             <section>
@@ -324,7 +401,16 @@ export class YawAlignApp extends LitElement {
         : null}
 
       <section>
-        <h2 style="margin-top:0;font-size:1.1rem;">对中记录</h2>
+        <div class="row-actions" style="margin-bottom:0.75rem;">
+          <h2 style="margin:0;font-size:1.1rem;flex:1;">对中记录</h2>
+          <button
+            class="secondary"
+            ?disabled=${this.loading}
+            @click=${this.refreshLogs}
+          >
+            刷新列表
+          </button>
+        </div>
         <table>
           <thead>
             <tr>
@@ -360,6 +446,44 @@ export class YawAlignApp extends LitElement {
           </tbody>
         </table>
       </section>
+    `;
+  }
+
+  render() {
+    if (!this.session) {
+      return html`
+        <h1>风机偏航对中台</h1>
+        <p class="sub">现场技师提交偏航误差，后台 worker 认领后给出合格或偏航超差结论。</p>
+        <section>
+          <label>用户名</label>
+          <input
+            .value=${this.loginUser}
+            @input=${(e: Event) =>
+              (this.loginUser = (e.target as HTMLInputElement).value)}
+          />
+          <label>密码</label>
+          <input
+            type="password"
+            .value=${this.loginPass}
+            @input=${(e: Event) =>
+              (this.loginPass = (e.target as HTMLInputElement).value)}
+          />
+          <button ?disabled=${this.loading} @click=${this.login}>登录</button>
+          ${this.error ? html`<p class="err">${this.error}</p>` : null}
+        </section>
+      `;
+    }
+
+    return html`
+      ${this.renderTopbar()}
+      ${this.view === "logs"
+        ? this.renderLogs()
+        : html`
+            <yaw-interlock
+              .session=${this.session}
+              @auth-expired=${this.logout}
+            ></yaw-interlock>
+          `}
     `;
   }
 }

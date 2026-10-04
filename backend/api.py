@@ -8,6 +8,7 @@ from passlib.context import CryptContext
 from quart import Quart, jsonify, request
 
 from db import SCHEMA, connect
+from interlock import check_submission, engage, ensure_state_row, fetch_state, release
 from rules import judge
 
 SECRET = os.environ.get("JWT_SECRET", "yaw-align-dev-secret")
@@ -62,6 +63,7 @@ async def startup():
     def init():
         with connect() as conn:
             seed_if_empty(conn)
+            ensure_state_row(conn)
             conn.commit()
 
     await run_db(init)
@@ -99,17 +101,22 @@ def require_login(handler):
     return wrapper
 
 
-def require_writer(handler):
-    @wraps(handler)
-    async def wrapper(*args, **kwargs):
-        user = await current_user()
-        if user is None:
-            return jsonify({"detail": "未登录"}), 401
-        if user["role"] != "writer":
-            return jsonify({"detail": "仅现场技师可提交偏航记录"}), 403
-        return await handler(user, *args, **kwargs)
+def require_writer(handler=None, *, detail="仅现场技师可提交偏航记录"):
+    def decorate(fn):
+        @wraps(fn)
+        async def wrapper(*args, **kwargs):
+            user = await current_user()
+            if user is None:
+                return jsonify({"detail": "未登录"}), 401
+            if user["role"] != "writer":
+                return jsonify({"detail": detail}), 403
+            return await fn(user, *args, **kwargs)
 
-    return wrapper
+        return wrapper
+
+    if handler is None:
+        return decorate
+    return decorate(handler)
 
 
 @app.get("/api/health")
@@ -171,6 +178,11 @@ async def create_log(user):
 
     def insert():
         with connect() as conn:
+            rejection = check_submission(conn, user["username"], turbine_code, now)
+            if rejection is not None:
+                # 退回流水与拒收决定在同一事务提交，随后整单退回
+                conn.commit()
+                return {"rejection": rejection}
             row = conn.execute(
                 """INSERT INTO yaw_logs
                    (turbine_code, yaw_err_deg, status, verdict, reason,
@@ -181,7 +193,93 @@ async def create_log(user):
                 (turbine_code, yaw_err_deg, user["username"], now),
             ).fetchone()
             conn.commit()
-            return row
+            return {"row": row}
 
-    row = await run_db(insert)
-    return jsonify(row), 201
+    result = await run_db(insert)
+    if "rejection" in result:
+        rejection = result["rejection"]
+        return (
+            jsonify(
+                {
+                    "detail": rejection["detail"],
+                    "reading_kv_m": rejection["reading_kv_m"],
+                    "threshold_kv_m": rejection["threshold_kv_m"],
+                }
+            ),
+            409,
+        )
+    return jsonify(result["row"]), 201
+
+
+@app.get("/api/interlock")
+@require_login
+async def interlock_status(user):
+    def query():
+        with connect() as conn:
+            return fetch_state(conn)
+
+    state = await run_db(query)
+    return jsonify(state)
+
+
+@app.get("/api/interlock/events")
+@require_login
+async def interlock_events(user):
+    def query():
+        with connect() as conn:
+            return conn.execute(
+                """SELECT id, event_type, threshold_kv_m, reading_kv_m, actor,
+                          turbine_code, detail, created_at
+                   FROM interlock_events
+                   ORDER BY id DESC
+                   LIMIT 100"""
+            ).fetchall()
+
+    rows = await run_db(query)
+    return jsonify(rows)
+
+
+@app.post("/api/interlock/engage")
+@require_writer(detail="仅现场技师可操作雷电联闸")
+async def interlock_engage(user):
+    body = await request.get_json(force=True, silent=True) or {}
+    try:
+        threshold_kv_m = float(body.get("threshold_kv_m"))
+    except (TypeError, ValueError):
+        return jsonify({"detail": "电场上限必须是数字"}), 400
+    if not 0 < threshold_kv_m <= 100:
+        return jsonify({"detail": "电场上限需在 0~100 kV/m 之间"}), 400
+
+    now = datetime.now(timezone.utc)
+
+    def tx():
+        with connect() as conn:
+            result, err = engage(conn, user["username"], threshold_kv_m, now)
+            if err is not None:
+                return {"err": err}
+            conn.commit()
+            return {"result": result}
+
+    out = await run_db(tx)
+    if "err" in out:
+        return jsonify({"detail": out["err"]}), 409
+    return jsonify(out["result"])
+
+
+@app.post("/api/interlock/release")
+@require_writer(detail="仅现场技师可操作雷电联闸")
+async def interlock_release(user):
+    now = datetime.now(timezone.utc)
+
+    def tx():
+        with connect() as conn:
+            result, err = release(conn, user["username"], now)
+            if err is not None:
+                return {"err": err}
+            conn.commit()
+            return {"result": result}
+
+    out = await run_db(tx)
+    if "err" in out:
+        return jsonify({"detail": out["err"]}), 409
+    return jsonify(out["result"])

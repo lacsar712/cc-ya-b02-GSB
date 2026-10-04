@@ -1,4 +1,8 @@
-"""后台 worker：用 SKIP LOCKED 认领 pending 记录并写入判定结论。"""
+"""后台 worker：用 SKIP LOCKED 认领 pending 记录并写入判定结论。
+
+同时周期采集场站电场读数写入 interlock_state，供雷电联闸拦截判定
+与前端展示；采样只能发生在服务端，前端不得自填。
+"""
 
 import os
 import time
@@ -8,6 +12,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 from db import SCHEMA, connect
+from interlock import collect_reading, ensure_state_row
 from rules import judge
 
 POLL_SEC = float(os.environ.get("WORKER_POLL_SEC", "0.5"))
@@ -16,6 +21,7 @@ IDLE_SEC = float(os.environ.get("WORKER_IDLE_SEC", "1.0"))
 
 def ensure_schema(conn):
     conn.execute(SCHEMA)
+    ensure_state_row(conn)
     conn.commit()
 
 
@@ -49,11 +55,10 @@ def main():
     while True:
         try:
             with connect() as conn:
-                if claim_and_process(conn):
-                    conn.commit()
-                    time.sleep(POLL_SEC)
-                else:
-                    time.sleep(IDLE_SEC)
+                collect_reading(conn)
+                processed = claim_and_process(conn)
+                conn.commit()
+                time.sleep(POLL_SEC if processed else IDLE_SEC)
         except psycopg.Error as exc:
             print(f"worker db error: {exc}", flush=True)
             time.sleep(IDLE_SEC)
